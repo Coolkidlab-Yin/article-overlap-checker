@@ -1,0 +1,9 @@
+# 掃描報告不進版控。副檔名 .md 的報告可能取任何名字,
+# 這裡擋常見的幾個;examples/ 底下的範例報告不受影響(有明確保留規則)
+report.md
+r.md
+outputs/
+
+__pycache__/
+*.pyc
+.env
