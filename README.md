@@ -10,15 +10,55 @@
 
 純 Python 標準庫、零依賴、中英混排通吃(CJK 字元 bigram)。0.33 秒掃 50 頁。
 
+## 環境需求
+
+Python 3.8+,**不用 pip install 任何東西**(純標準庫)。確認裝好了:
+
+```bash
+python semantic_map.py --help
+```
+
+印得出說明就可以開始。前提是你有一份網站的 HTML(靜態站的建置輸出資料夾,
+或線上站的 sitemap.xml);沒有的話這工具沒東西可掃。
+
 ## 使用
 
 ```bash
 # 本機 HTML 資料夾(建議掃整個站的輸出目錄,只掃子資料夾會高估孤島)
 python semantic_map.py --dir <網站輸出資料夾> --out report.md
 
-# 或直接掃線上 sitemap(會逐頁下載,頁多時較慢)
+# 或直接掃線上 sitemap(逐頁下載,實測 130 頁約 7 分鐘 — 掃本機快得多)
 python semantic_map.py --sitemap https://example.com/sitemap.xml --out report.md
 ```
+
+**成功長這樣**:終端印出 `報告已寫入 report.md`,打開報告第一行是
+`# 語意地圖報告(N 頁)`,N 等於你預期的頁數。完整範例見
+[examples/sample-report.md](examples/sample-report.md)。
+
+## 報告顯示「無撞稿」的時候,先別高興
+
+報告有一段「**相似度分布**」,列出全站最高的 10 組配對,**不受閾值影響**。
+先看那段:
+
+- 最高分 0.7、門檻 0.62 → 門檻位置合理,「無」是真的無。
+- 最高分 0.15、門檻 0.62 → 門檻太高,你看到的「無」是假的。這通常代表
+  這個站的用詞比較分散(換句話說寫同一件事),TF-IDF 抓不到詞面重疊。
+
+要往下調的時候,**`--close` 和 `--cannibal` 要一起調**。只調 `--cannibal`
+不會有變化,因為報告只收錄相似度 >= `--close` 的配對。報告的分布段會直接
+給你一組建議數值,照著用即可。
+
+## 常見錯誤
+
+| 症狀 | 原因 | 解法 |
+|---|---|---|
+| `找不到資料夾:xxx` | 路徑打錯 | 確認路徑存在(這跟「站上沒內容」是兩回事) |
+| `頁數不足(<2)` | 掃錯層,或頁面正文都不到 200 字 | 指到建置輸出的**根目錄**,不要只指子資料夾 |
+| 撞稿區一排 `1.000` | 掃到建置殘留的舊站副本 | 排除備份/舊版目錄再掃 |
+| `抓不到 sitemap:...` | 網址錯、對方沒掛 sitemap、或被擋 | 先用瀏覽器開開看;或改用 `--dir` |
+| `沒有任何 <loc> 條目` | 網址不是 sitemap(常見:貼到首頁) | 找對 sitemap 網址再跑 |
+| 一堆 `skip` + `⚠ N 頁裡有 M 頁抓失敗` | 對方擋或逾時,報告只涵蓋殘存頁面 | **不要拿這份報告下結論**,先解決抓取問題 |
+| 提示「這份 sitemap 裡有指向其他 .xml 的條目」 | 巢狀 sitemap,本工具只吃單層 | 改用子 sitemap 網址,或用 `--dir` |
 
 也可以當 Claude Code plugin 用(裝了之後直接用講的,AI 會跑工具幫你讀報告):
 
@@ -26,6 +66,10 @@ python semantic_map.py --sitemap https://example.com/sitemap.xml --out report.md
 /plugin marketplace add Coolkidlab-Yin/Coolkidlab
 /plugin install article-overlap-checker@coolkidlab
 ```
+
+> 這個獨立 repo 只放裸腳本。plugin 版本(含 SKILL.md,讓 Claude Code 直接代跑)
+> 住在 [Coolkidlab marketplace repo](https://github.com/Coolkidlab-Yin/Coolkidlab),
+> 用上面兩行安裝即可,**不需要 clone 本 repo**。
 
 ## 讀報告的原則
 
