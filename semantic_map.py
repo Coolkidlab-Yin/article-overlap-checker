@@ -20,10 +20,16 @@
 import argparse
 import heapq
 import html as html_mod
+import http.client
+import ipaddress
 import math
 import re
+import socket
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
@@ -31,6 +37,8 @@ from pathlib import Path
 USER_AGENT = "Mozilla/5.0 (compatible; article-overlap-checker/1.0; +https://github.com/Coolkidlab-Yin/article-overlap-checker)"
 
 TOP_N = 10  # 報告固定列出的最高分配對數量(不受閾值影響,用來判斷閾值調得對不對)
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
 
 CANNIBAL_T = 0.62  # >= 此值:撞稿候選(經驗閾值,供排序與人工複核,非鐵律)
 CLOSE_T = 0.55     # >= 此值:太接近,新文建議換角度
@@ -83,16 +91,155 @@ def load_from_dir(root: Path) -> list:
     return pages
 
 
-def fetch(url: str, timeout: int = 30) -> str:
-    """帶 UA 抓一頁。少了 UA,掛 CDN 的站會回 403(含本工具作者自己的站)。"""
+def _validate_public_https_target(
+    url: str,
+    allowed_origin: tuple[str, str, int] | None = None,
+) -> tuple[tuple[str, str, int], tuple[str, ...]]:
+    """Validate the URL and return the public IPs that the transport must pin."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("只允許有主機名的 HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ValueError("URL 不可包含帳號或密碼")
+    port = parsed.port or 443
+    if port != 443:
+        raise ValueError("只允許 HTTPS 的 443 port")
+    host = parsed.hostname.rstrip(".").lower()
+    origin = ("https", host, port)
+    if allowed_origin is not None and origin != allowed_origin:
+        raise ValueError(f"拒絕跨來源 URL:{url}")
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not addresses:
+        raise ValueError(f"DNS 無結果:{host}")
+    public_ips: list[str] = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0].split("%", 1)[0])
+        if not ip.is_global:
+            raise ValueError(f"拒絕非公開位址:{host}")
+        rendered = str(ip)
+        if rendered not in public_ips:
+            public_ips.append(rendered)
+    return origin, tuple(public_ips)
+
+
+def validate_public_https_url(
+    url: str,
+    allowed_origin: tuple[str, str, int] | None = None,
+) -> tuple[str, str, int]:
+    """Reject credentials, non-HTTPS URLs, non-standard ports and non-public DNS targets."""
+    origin, _ = _validate_public_https_target(url, allowed_origin)
+    return origin
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to prevalidated IPs while keeping the original host for SNI and cert checks."""
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_ips: tuple[str, ...],
+        expected_hostname: str,
+        **kwargs,
+    ) -> None:
+        self.pinned_ips = pinned_ips
+        self.expected_hostname = expected_hostname
+        super().__init__(host, **kwargs)
+
+    def connect(self) -> None:
+        last_error: OSError | None = None
+        for pinned_ip in self.pinned_ips:
+            sock = None
+            try:
+                sock = self._create_connection(
+                    (pinned_ip, self.port),
+                    self.timeout,
+                    self.source_address,
+                )
+                self.sock = self._context.wrap_socket(
+                    sock,
+                    server_hostname=self.expected_hostname,
+                )
+                return
+            except OSError as exc:
+                last_error = exc
+                if sock is not None:
+                    sock.close()
+        raise OSError("無法連線到已驗證的公開 IP") from last_error
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pinned_ips: tuple[str, ...], expected_hostname: str) -> None:
+        super().__init__()
+        self.pinned_ips = pinned_ips
+        self.expected_hostname = expected_hostname
+
+    def https_open(self, req):  # noqa: ANN001
+        def connection_factory(host, **kwargs):  # noqa: ANN001
+            return PinnedHTTPSConnection(
+                host,
+                pinned_ips=self.pinned_ips,
+                expected_hostname=self.expected_hostname,
+                **kwargs,
+            )
+
+        return self.do_open(
+            connection_factory,
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allowed_origin: tuple[str, str, int]) -> None:
+        super().__init__()
+        self.allowed_origin = allowed_origin
+        self.redirects = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        self.redirects += 1
+        if self.redirects > MAX_REDIRECTS:
+            raise urllib.error.HTTPError(newurl, code, "redirect 次數過多", headers, fp)
+        validate_public_https_url(newurl, self.allowed_origin)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch(
+    url: str,
+    *,
+    allowed_origin: tuple[str, str, int] | None = None,
+    expected_types: set[str] | None = None,
+    timeout: int = 30,
+) -> str:
+    """Fetch a bounded public HTTPS resource, revalidating every redirect."""
+    origin, pinned_ips = _validate_public_https_target(url, allowed_origin)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        SafeRedirectHandler(allowed_origin or origin),
+        PinnedHTTPSHandler(pinned_ips, origin[1]),
+    )
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", errors="ignore")
+    with opener.open(req, timeout=timeout) as response:
+        validate_public_https_url(response.geturl(), allowed_origin or origin)
+        content_type = response.headers.get_content_type().lower()
+        if expected_types and content_type not in expected_types:
+            raise ValueError(f"不接受的 Content-Type:{content_type}")
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ValueError(f"回應超過 {MAX_RESPONSE_BYTES} bytes")
+    return raw.decode("utf-8", errors="ignore")
 
 
-def load_from_sitemap(url: str) -> list:
+def load_from_sitemap(url: str) -> tuple[list, bool]:
+    """Load public pages and report whether the source is too incomplete to trust."""
     try:
-        sm = fetch(url)
+        sitemap_origin = validate_public_https_url(url)
+        sm = fetch(
+            url,
+            allowed_origin=sitemap_origin,
+            expected_types={"application/xml", "text/xml", "text/plain", "application/octet-stream"},
+        )
     except Exception as e:  # noqa: BLE001 — 抓不到 sitemap 是使用者輸入問題,不該吐 traceback
         print(
             f"抓不到 sitemap:{url}\n  {e}\n"
@@ -100,8 +247,33 @@ def load_from_sitemap(url: str) -> list:
             f"是不是被擋。掃本機建置輸出可以改用 --dir。",
             file=sys.stderr,
         )
-        return []
-    locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", sm)
+        return [], True
+    try:
+        root = ET.fromstring(sm)
+    except ET.ParseError as exc:
+        print(f"sitemap XML 無法解析:{exc}", file=sys.stderr)
+        return [], True
+
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1].lower()
+
+    if local_name(root.tag) == "sitemapindex":
+        print(
+            "  注意:這份網址是 sitemap index。本工具只吃單層 sitemap,"
+            "因此會停止且不產生報告 —— 請改用子 sitemap 的網址,"
+            "或用 --dir 掃本機建置輸出。",
+            file=sys.stderr,
+        )
+        return [], True
+    if local_name(root.tag) != "urlset":
+        print(f"不支援的 sitemap 根元素:{local_name(root.tag)}", file=sys.stderr)
+        return [], True
+
+    locs = [
+        element.text.strip()
+        for element in root.iter()
+        if local_name(element.tag) == "loc" and element.text and element.text.strip()
+    ]
     if not locs:
         print(
             f"這個網址抓得到,但裡面沒有任何 <loc> 條目:{url}\n"
@@ -109,18 +281,17 @@ def load_from_sitemap(url: str) -> list:
             f"先用瀏覽器開開看,內容應該是一堆 <url><loc>...</loc></url>。",
             file=sys.stderr,
         )
-        return []
-    if any(loc.rstrip().endswith((".xml", ".xml.gz")) for loc in locs):
-        print(
-            "  注意:這份 sitemap 裡有指向其他 .xml 的條目(sitemap index)。"
-            "本工具只吃單層 sitemap,巢狀的子 sitemap 會被當成網頁抓而失敗 —— "
-            "請改用子 sitemap 的網址,或用 --dir 掃本機建置輸出。",
-            file=sys.stderr,
-        )
+        return [], True
     pages, failed = [], 0
     for loc in locs:
         try:
-            text = strip_html(fetch(loc))
+            text = strip_html(
+                fetch(
+                    loc,
+                    allowed_origin=sitemap_origin,
+                    expected_types={"text/html", "application/xhtml+xml", "text/plain"},
+                )
+            )
             if len(text) > 200:
                 pages.append((loc, text))
             print(f"  fetched {loc}", file=sys.stderr)
@@ -128,13 +299,14 @@ def load_from_sitemap(url: str) -> list:
             failed += 1
             print(f"  skip {loc}: {e}", file=sys.stderr)
     # 大部分頁面掛掉時,報告只涵蓋殘存的少數頁,結論會失真。靜默成功比失敗更糟。
-    if failed and failed >= len(locs) / 2:
+    incomplete = bool(failed and failed >= len(locs) / 2)
+    if incomplete:
         print(
-            f"\n⚠ {len(locs)} 頁裡有 {failed} 頁抓失敗,這份報告只涵蓋 {len(pages)} 頁,"
-            f"不足以下結論。\n  先處理抓取問題(對方擋、逾時、網址失效)再重跑。",
+            f"\n[部分失敗] {len(locs)} 頁裡有 {failed} 頁抓失敗,只取得 {len(pages)} 頁,"
+            f"不足以下結論。\n  不會產生報告;先處理抓取問題(對方擋、逾時、網址失效)再重跑。",
             file=sys.stderr,
         )
-    return pages
+    return pages, incomplete
 
 
 def main() -> int:
@@ -145,7 +317,7 @@ def main() -> int:
     ap.add_argument(
         "--cannibal", type=float, default=CANNIBAL_T,
         help=f"撞稿候選的相似度門檻(預設 {CANNIBAL_T})。調低會列出更多候選。"
-             f"注意:要低於 --close 才看得到,兩個都要一起調",
+             f"注意:--close 必須小於或等於 --cannibal,往下調時通常兩個一起調",
     )
     ap.add_argument(
         "--close", type=float, default=CLOSE_T,
@@ -155,6 +327,9 @@ def main() -> int:
     ap.add_argument("--out", help="輸出 Markdown 報告路徑(省略則印到終端)")
     args = ap.parse_args()
 
+    if not 0 <= args.close <= args.cannibal <= 1:
+        ap.error("門檻必須符合 0 <= --close <= --cannibal <= 1")
+
     if args.dir:
         root = Path(args.dir)
         # 路徑打錯跟「站上真的沒東西」是兩件事,分開講,不然使用者會誤判自己的站空了。
@@ -163,7 +338,9 @@ def main() -> int:
             return 2
         pages = load_from_dir(root)
     else:
-        pages = load_from_sitemap(args.sitemap)
+        pages, incomplete = load_from_sitemap(args.sitemap)
+        if incomplete:
+            return 3
     if len(pages) < 2:
         hint = (
             "是不是掃錯層(要指到建置輸出的根目錄)、或頁面正文都不到 200 字"
