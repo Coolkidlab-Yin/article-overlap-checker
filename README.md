@@ -14,6 +14,8 @@
 
 Python 3.8+,**不用 pip install 任何東西**(純標準庫)。確認裝好了:
 
+選配:設環境變數 `TYPESAFE_API_KEY`(在 [typesafe.ai](https://typesafe.ai) 申請),報告裡每組配對會多一欄「Jev 同意圖/不同意圖 0.xx」——由 TypeSafe 的 Jev 模型讀兩頁正文判斷是不是在回答同一個搜尋意圖,補 TF-IDF 只看詞面的缺口。沒設就跟以前一樣,仍是純標準庫、零依賴。
+
 ```bash
 python semantic_map.py --help
 ```

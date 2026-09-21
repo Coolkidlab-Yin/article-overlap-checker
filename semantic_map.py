@@ -43,6 +43,54 @@ MAX_REDIRECTS = 5
 CANNIBAL_T = 0.62  # >= 此值:撞稿候選(經驗閾值,供排序與人工複核,非鐵律)
 CLOSE_T = 0.55     # >= 此值:太接近,新文建議換角度
 ISLAND_T = 0.15    # 全站最大相似度 < 此值:孤島頁
+JEV_MAX_PAIRS = 50  # 有 TYPESAFE_API_KEY 時,最多拿這麼多組配對去問 Jev「是不是同一個搜尋意圖」
+
+
+def _jev(state: dict, questions: dict):
+    """問 TypeSafe Jev(typesafe.ai)。沒設 TYPESAFE_API_KEY 或任何錯誤 → None。
+    仍是純標準庫:直接 urllib 打 HTTP。"""
+    import json
+    import os
+
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        return None
+    req = urllib.request.Request(
+        "https://api.typesafe.ai/v1/systemone",
+        data=json.dumps({"state": state, "model": "jev-latest", "questions": questions}).encode(),
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)["answers"]
+    except Exception:  # noqa: BLE001 - 複核只是輔助,失敗就當沒問
+        return None
+
+
+def jev_intent(text_of: dict, pairs: list) -> dict:
+    """相似度高不等於撞稿:教學 vs 比較文用詞很像但服務不同意圖。
+    對每組配對問 Jev「這兩頁是不是在回答同一個搜尋意圖」,回 {(a, b): (標籤, 機率)}。"""
+    out = {}
+    for _s, a, b in pairs[:JEV_MAX_PAIRS]:
+        ans = _jev(
+            {"page_a": {"name": a, "excerpt": text_of[a][:700]},
+             "page_b": {"name": b, "excerpt": text_of[b][:700]}},
+            {"intent": {"type": "choice",
+                        "instructions": "這兩頁是不是在回答同一個搜尋意圖(同一群人、同一個問題)?",
+                        "criteria": {"same": "同一個搜尋意圖,搜尋引擎難以決定該排哪一頁",
+                                     "different": "用詞相似但服務不同意圖(例如教學 vs 比較 vs 新聞),可以共存"}}},
+        )
+        if not ans:
+            break  # 第一組就問不到,大概是沒 key 或斷網,後面不必再試
+        c = ans["intent"]
+        p = c["probabilities"].get(c["choice"], 0.0)
+        out[(a, b)] = ("同意圖" if c["choice"] == "same" else "不同意圖", p) if p >= 0.7 else ("拿不準", p)
+    return out
+
+
+def _tag(verdicts: dict, a: str, b: str) -> str:
+    v = verdicts.get((a, b))
+    return f"   · Jev {v[0]} {v[1]:.2f}" if v else ""
 
 
 def strip_html(raw: str) -> str:
@@ -376,17 +424,19 @@ def main() -> int:
     top.sort(reverse=True)
     islands = sorted((max_sim[i], names[i]) for i in range(len(pages)) if max_sim[i] < ISLAND_T)
 
+    verdicts = jev_intent(dict(pages), pairs)
+
     lines = [f"# 語意地圖報告({len(pages)} 頁)", ""]
     lines.append(f"## 撞稿候選(相似度 >= {args.cannibal})")
     hit = [p for p in pairs if p[0] >= args.cannibal]
-    lines += [f"- **{s:.3f}**  {a}  ↔  {b}" for s, a, b in hit] or [
+    lines += [f"- **{s:.3f}**  {a}  ↔  {b}{_tag(verdicts, a, b)}" for s, a, b in hit] or [
         f"- 無 —— 沒有任何一組配對達到 {args.cannibal}。"
         f"**先看下面的「相似度分布」再下結論**:如果最高分離門檻很遠,"
         f"代表這個站的用詞本來就分散,門檻該往下調,不是真的沒撞稿。"
     ]
     lines += ["", f"## 太接近(>= {args.close},新文換角度)"]
     near = [p for p in pairs if p[0] < args.cannibal]
-    lines += [f"- {s:.3f}  {a}  ↔  {b}" for s, a, b in near] or ["- 無"]
+    lines += [f"- {s:.3f}  {a}  ↔  {b}{_tag(verdicts, a, b)}" for s, a, b in near] or ["- 無"]
     lines += ["", f"## 相似度分布(全站最高的 {len(top)} 組,不受閾值影響)", ""]
     lines += [
         "先看這一段再看上面兩段。這裡列的是全站相似度最高的配對,不管門檻設多少都會列 —— "
@@ -413,6 +463,10 @@ def main() -> int:
     lines += [f"- {s:.3f}  {n}" for s, n in islands] or ["- 無 ✅"]
     lines += ["", "> 閾值是經驗值非鐵律:撞稿候選請人工複核搜尋意圖是否真的相同;",
               "> 兩頁服務不同意圖(教學 vs 比較)即使相似也可共存。"]
+    if verdicts:
+        lines.append(f"> 「Jev 同意圖/不同意圖」是 TypeSafe Jev 對前 {len(verdicts)} 組的複核(機率 < 0.7 標拿不準),幫你排優先順序,仍請人看。")
+    else:
+        lines.append("> 設環境變數 TYPESAFE_API_KEY(typesafe.ai)可讓 Jev 幫每組配對複核搜尋意圖是否相同。")
 
     report = "\n".join(lines)
     if args.out:
